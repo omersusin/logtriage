@@ -135,7 +135,30 @@ lands on original 12. When the mapping was built with line-number stripping,
 the method name is still recovered but no line number is invented. Frames it
 cannot resolve are left alone rather than guessed at.
 
-## Root vs no root
+## Root: which flavour you have matters
+
+`logtriage doctor` identifies the root implementation and prints notes for it.
+It fingerprints the **SELinux domain**, because that is set by the root solution
+itself rather than by whatever shell invoked `su`:
+
+| Domain | Means |
+|---|---|
+| `u:r:ksu:s0` | KernelSU |
+| `u:r:magisk:s0` | Magisk |
+| `u:r:su:s0` | ambiguous — KernelPatch/APatch, or KernelSU-Next |
+| `u:r:init:s0` | fell back to init context |
+
+It cross-checks that against marker directories in `/data/adb` and version
+banners (`KSU_VER`, `magisk -V`).
+
+The distinction matters because **KernelSU grants root per-app and hides `su`
+from every app it has not permitted** — so a missing `su` means "not allowed",
+not "not rooted", and the fix is completely different. That is why `doctor`
+distinguishes them instead of reporting a bare boolean.
+
+```bash
+logtriage doctor
+```
 
 Root is optional and only widens coverage:
 
@@ -143,6 +166,10 @@ Root is optional and only widens coverage:
   `dumpsys media.audio_flinger`, `dumpsys audio`, `dumpsys thermalservice`,
   `/data/anr/traces.txt`, `dmesg`.
 - **Unrooted:** plain `logcat -b all -v threadtime -d`. No prompt, no failure.
+
+Never run `su` first from an interactive shell: it hands you Android's
+`/system/bin/sh` with Android's `PATH`, and this command vanishes from the
+prompt. `logtriage` calls `su -c` itself.
 
 ## Tests
 

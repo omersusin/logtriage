@@ -466,8 +466,133 @@ def run(cmd: list[str], timeout: int = 60) -> str:
         return ""
 
 
+# A root manager (KernelSU / Magisk / APatch) may gate the first su request.
+# If we time out before it is answered we must not silently look "unrooted" -
+# that reads as a bug. 60s leaves room to actually approve it.
+ROOT_TIMEOUT = 60
+
+# PATH alone is not enough to find su: a bare interactive `su` needs no help,
+# but an app spawning su from a restricted environment can have a minimal PATH
+# while the binary still exists on disk.
+SU_CANDIDATES = ("/system/bin/su", "/system/xbin/su", "/debug_ramdisk/su",
+                 "/sbin/su", "/data/adb/magisk/su")
+
+
+def find_su() -> str | None:
+    """Locate su on PATH, then at the usual root-manager/system locations."""
+    found = shutil.which("su")
+    if found:
+        return found
+    for cand in SU_CANDIDATES:
+        try:
+            if Path(cand).exists():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+# Root implementations, keyed by the on-disk marker each one drops in /data/adb.
+# Sources: kernelsu.org/guide, apatch.dev/faq.
+ROOT_DIRS = {
+    "/data/adb/ksu": "KernelSU",
+    "/data/adb/magisk": "Magisk",
+    "/data/adb/ap": "APatch",
+    "/data/adb/kp": "KernelPatch",
+}
+# The SELinux domain is the most reliable fingerprint: it is set by the root
+# solution itself, not by whatever shell happens to invoke su.
+#   u:r:ksu:s0     KernelSU
+#   u:r:magisk:s0  Magisk
+#   u:r:su:s0      ambiguous - KernelPatch/APatch, or KernelSU-Next
+SELINUX_FINGERPRINT = {
+    "ksu": "KernelSU",
+    "magisk": "Magisk",
+    "su": "KernelPatch/APatch or KernelSU-Next (ambiguous domain u:r:su:s0)",
+    "init": "unknown (fell back to u:r:init:s0)",
+}
+RE_SELINUX_CTX = re.compile(r"context=u:r:([\w]+):s\d")
+
+
+def detect_root_impl(su: str) -> tuple[str, str]:
+    """Identify which root solution is in use. Returns (name, evidence).
+
+    Probes three independent signals, because any one of them can lie:
+      1. the SELinux domain from `id` - set by the root implementation itself
+      2. marker directories under /data/adb - KernelSU hides these from apps it
+         has not permitted, so absence proves nothing
+      3. version banners: KernelSU exports KSU_VER, Magisk answers `magisk -V`
+    """
+    evidence: list[str] = []
+
+    idout = run([su, "-c", "id"], timeout=25)
+    ctx = RE_SELINUX_CTX.search(idout)
+    if ctx:
+        evidence.append("selinux=u:r:%s:s0" % ctx.group(1))
+
+    listing = run([su, "-c", "ls -d /data/adb/*/ 2>/dev/null"], timeout=25)
+    found = {name for path, name in ROOT_DIRS.items() if path in listing}
+    if found:
+        evidence.append("markers=" + "+".join(sorted(found)))
+
+    for label, cmd, rx in (
+        ("KernelSU", "echo ${KSU_VER:-}", r"v[\w.\-]+"),
+        ("Magisk", "magisk -V 2>/dev/null", r"[\d.]+"),
+        ("APatch", "echo ${APATCH_VERSION:-}${KP_VERSION:-}", r"[\w.\-]+"),
+    ):
+        out = run([su, "-c", cmd], timeout=25).strip()
+        if out and re.search(rx, out):
+            evidence.append("%s=%s" % (label, out.splitlines()[0][:24]))
+
+    name = ""
+    if ctx and ctx.group(1) in ("ksu", "magisk"):
+        name = SELINUX_FINGERPRINT[ctx.group(1)]
+    elif found:
+        name = sorted(found)[0]
+    elif ctx:
+        name = SELINUX_FINGERPRINT.get(ctx.group(1), ctx.group(1))
+    if not name:
+        name = "unknown root implementation"
+
+    return name, ", ".join(evidence) if evidence else "no identifying signal"
+
+
+def probe_root() -> tuple[bool, str]:
+    """Return (is_root, human-readable reason).
+
+    The reason matters more than the boolean. "Not rooted", "Termux not on the
+    root manager allowlist", "denied", and "you never approved the prompt" all
+    fail identically but need completely different fixes.
+    """
+    su = find_su()
+    if not su:
+        return False, ("no `su` visible to Termux. Two very different causes: "
+                       "the device is not rooted, OR Termux is not on the root "
+                       "manager allowlist. KernelSU deliberately hides su from "
+                       "every app it has not permitted, so a missing su does NOT "
+                       "mean no root. Open the root manager and allow Termux, "
+                       "then re-run `logtriage doctor`.")
+    try:
+        proc = subprocess.run([su, "-c", "id"], capture_output=True,
+                              text=True, timeout=ROOT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, ("`%s` gave no answer within %ds - the root request was "
+                       "probably never approved. Run `logtriage doctor` and "
+                       "allow it." % (su, ROOT_TIMEOUT))
+    except OSError as e:
+        return False, "`%s` could not be executed: %s" % (su, e)
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    if "uid=0" in out:
+        return True, "root OK via %s" % su
+    if proc.returncode != 0:
+        return False, ("`%s` refused (exit %d): %s - check your root manager, "
+                       "Termux must be on the allowlist"
+                       % (su, proc.returncode, out[:140] or "no output"))
+    return False, "`%s` ran but was not uid=0: %s" % (su, out[:140])
+
+
 def has_root() -> bool:
-    return "uid=0" in run(["su", "-c", "id"], timeout=10)
+    return probe_root()[0]
 
 
 def capture_root() -> Path:
@@ -499,11 +624,14 @@ def capture(outdir: Path | None = None, follow: bool = False) -> int:
     d.mkdir(parents=True, exist_ok=True)
     print(f"logtriage: capturing -> {d}", file=sys.stderr)
 
-    if shutil.which("su"):
-        print("logtriage: requesting root — approve the Magisk prompt if it "
-              "appears (it will not appear again once granted).", file=sys.stderr)
+    if find_su():
+        print("logtriage: requesting root — approve the prompt if your root "
+              "manager shows one (KernelSU/Magisk may grant silently once "
+              "Termux is allowed).", file=sys.stderr)
 
-    if has_root():
+    rooted, why = probe_root()
+    if rooted:
+        print(f"logtriage: {why}", file=sys.stderr)
         run(["su", "-c", "logcat -c"], timeout=20)
         cmds = {
             "logcat.txt": "logcat -b all -v threadtime -d",
@@ -518,7 +646,10 @@ def capture(outdir: Path | None = None, follow: bool = False) -> int:
             print(f"  - {name}", file=sys.stderr)
             (d / name).write_text(run(["su", "-c", c], timeout=90), errors="replace")
     else:
-        print("logtriage: no root — falling back to plain `logcat -d`.", file=sys.stderr)
+        print(f"logtriage: NOT rooted — {why}", file=sys.stderr)
+        print("logtriage: falling back to plain `logcat -d`. Only logcat.txt "
+              "will be captured (no audio_flinger, thermal, ANR or dmesg).",
+              file=sys.stderr)
         (d / "logcat.txt").write_text(
             run(["logcat", "-b", "all", "-v", "threadtime", "-d"], timeout=90),
             errors="replace")
@@ -649,6 +780,63 @@ def watch(interval: float, retracer: Retracer | None) -> int:
 
 # --------------------------------------------------------------------------
 
+def doctor() -> int:
+    print("logtriage doctor")
+    print("-" * 60)
+    print(f"python       : {sys.version.split()[0]}  ({sys.executable})")
+    print(f"script       : {Path(__file__).parent}")
+
+    sd = Path("/sdcard")
+    try:
+        root_dir = capture_root()
+        probe = root_dir / ".wtest"
+        probe.touch()
+        probe.unlink()
+        print(f"captures ->  : {root_dir}  (writable)")
+    except OSError as e:
+        print(f"captures ->  : PROBLEM — {e}")
+    print(f"/sdcard      : {'present' if sd.exists() else 'MISSING'}")
+
+    su = find_su()
+    print(f"su on PATH   : {shutil.which('su') or 'not found'}")
+    print(f"su on disk   : {su or 'not found in any known location'}")
+
+    rooted, why = probe_root()
+    print(f"su -c id     : {why}")
+
+    if rooted and su:
+        name, evidence = detect_root_impl(su)
+        print(f"root impl    : {name}")
+        print(f"evidence     : {evidence}")
+        print()
+        if name.startswith("KernelSU"):
+            print("KernelSU notes:")
+            print("  - grant is per-app in the KernelSU manager; su is invisible")
+            print("    to any app it has not permitted, so a missing su means")
+            print("    'not allowed', not 'not rooted'.")
+            print("  - its BusyBox lives at /data/adb/ksu/bin/busybox")
+            print("    (Magisk uses /data/adb/magisk/busybox)")
+            print("  - modules get KSU=true and KSU_VER in the environment")
+            print("  - no built-in Zygisk; uses ZygiskNext metamodule")
+        elif name == "Magisk":
+            print("Magisk notes:")
+            print("  - manager: Magisk app -> Superuser -> Termux -> grant")
+            print("  - BusyBox at /data/adb/magisk/busybox")
+    else:
+        print()
+        print("Fixing a root refusal depends on the actual cause:")
+        print("  - KernelSU: grant Termux in the KernelSU manager, then re-run.")
+        print("    `no su` here usually means Termux is not on the allowlist.")
+        print("  - Magisk: Magisk app -> Superuser -> Termux -> grant.")
+        print("  - unrooted: no root manager installed; logtriage will still")
+        print("    capture logcat, just not audio_flinger/thermal/ANR/dmesg.")
+
+    print()
+    print("Do NOT `su` first - that drops you into Android's /system/bin/sh with "
+          "Android's PATH, and logtriage vanishes from the command line.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="logtriage", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -656,6 +844,9 @@ def main(argv: list[str] | None = None) -> int:
 
     c = sub.add_parser("capture", help="collect logs into a timestamped directory")
     c.add_argument("-o", "--out", type=Path, default=None)
+
+    d = sub.add_parser("doctor", help="report environment: root, sdcard, python")
+    d.set_defaults(_noop=True)
 
     a = sub.add_parser("analyze", help="classify incidents in logs")
     a.add_argument("paths", nargs="+", help="files, dirs, or - for stdin")
@@ -671,6 +862,9 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("-m", "--mapping", type=Path, default=None)
 
     ns = ap.parse_args(argv)
+
+    if ns.cmd == "doctor":
+        return doctor()
 
     retracer: Retracer | None = None
     mp = getattr(ns, "mapping", None)

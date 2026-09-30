@@ -6,8 +6,8 @@ the log and mapping samples are inline so this stays one file.
 """
 import sys
 
-from logtriage import (FRAME, Frame, Retracer, parse_logcat_line, retrace_text,
-                       scan)
+from logtriage import (FRAME, SELINUX_FINGERPRINT, Frame, RE_SELINUX_CTX,
+                       Retracer, parse_logcat_line, retrace_text, scan)
 
 FAILS: list[str] = []
 
@@ -192,3 +192,22 @@ if FAILS:
         print("  x " + f)
     sys.exit(1)
 print("PASS — all checks green")
+
+# ------------------------------------------------- root-implementation detection
+# The SELinux domain is the reliable fingerprint, and it is pure string work,
+# so it is testable without root.
+KSU_ID = ("uid=0(root) gid=0(root) groups=0(root) context=u:r:ksu:s0")
+MAGISK_ID = ("uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0")
+APATCH_ID = ("uid=0(root) gid=0(root) groups=0(root) context=u:r:su:s0")
+
+check("ksu domain parsed", RE_SELINUX_CTX.search(KSU_ID).group(1), "ksu")
+check("magisk domain parsed", RE_SELINUX_CTX.search(MAGISK_ID).group(1), "magisk")
+check("apatch domain parsed", RE_SELINUX_CTX.search(APATCH_ID).group(1), "su")
+check("no domain in plain id", RE_SELINUX_CTX.search("uid=0(root) gid=0(root)"), None)
+
+check("ksu maps to KernelSU", SELINUX_FINGERPRINT["ksu"], "KernelSU")
+check("magisk maps to Magisk", SELINUX_FINGERPRINT["magisk"], "Magisk")
+check_true("su domain flagged ambiguous",
+           "ambiguous" in SELINUX_FINGERPRINT["su"])
+check_true("init domain flagged unknown",
+           "unknown" in SELINUX_FINGERPRINT["init"])
