@@ -1,0 +1,27 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.10 is the floor: all `X | None` syntax is annotation-only and
+        # guarded by `from __future__ import annotations`.
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run self-check
+        run: python3 test_logtriage.py
+      - name: Smoke-test the CLI
+        run: |
+          printf '09-26 23:30:00.581 1 1 E AndroidRuntime: FATAL EXCEPTION: main\n' > /tmp/c.txt
+          python3 logtriage.py analyze /tmp/c.txt || test $? -eq 1
+          python3 logtriage.py --help > /dev/null
