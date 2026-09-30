@@ -16,8 +16,8 @@ Exit codes: 0 = clean, 1 = findings, 2 = usage/IO error.
 from __future__ import annotations
 
 import argparse
-import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -470,10 +470,38 @@ def has_root() -> bool:
     return "uid=0" in run(["su", "-c", "id"], timeout=10)
 
 
+def capture_root() -> Path:
+    """Where captures go.
+
+    Internal storage by default: logs are the one artefact you actually want to
+    open in a file manager, pull over adb, or read from another app, and
+    /sdcard survives a Termux reinstall. Falls back to $HOME if sdcard is not
+    writable. Kept inside the project dir but gitignored, so a 4 MB logcat dump
+    never reaches a commit.
+    """
+    # `.parent`, not `.resolve()`: /sdcard is a symlink to /storage/emulated/0,
+    # and resolving it makes every printed path longer than what you typed.
+    here = Path(__file__).parent
+    for cand in (here / "captures", Path.home() / "logtriage-captures"):
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            probe = cand / ".wtest"
+            probe.touch()
+            probe.unlink()
+            return cand
+        except OSError:
+            continue
+    return Path.home() / "logtriage-captures"
+
+
 def capture(outdir: Path | None = None, follow: bool = False) -> int:
-    d = outdir or Path.home() / "logtriage" / time.strftime("%m%d-%H%M%S")
+    d = outdir or capture_root() / time.strftime("%m%d-%H%M%S")
     d.mkdir(parents=True, exist_ok=True)
     print(f"logtriage: capturing -> {d}", file=sys.stderr)
+
+    if shutil.which("su"):
+        print("logtriage: requesting root — approve the Magisk prompt if it "
+              "appears (it will not appear again once granted).", file=sys.stderr)
 
     if has_root():
         run(["su", "-c", "logcat -c"], timeout=20)

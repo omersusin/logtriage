@@ -22,14 +22,69 @@ This is the bash version turned into a tool. `ses-yakala.sh` +
 `ses-analiz.sh` already do the capture and the greps; logtriage does the
 capture, the classification, the retracing, and the reporting.
 
-## Install
+## Where logs are saved
 
-```bash
-ln -s ~/tools/logtriage/logtriage.py ~/.local/bin/logtriage
-chmod +x ~/tools/logtriage/logtriage.py
+Captures land on internal storage, not in Termux's private `$HOME` — logs are
+the one artefact you actually want to open in a file manager, pull over `adb`,
+or read from another app:
+
+```
+/sdcard/logtriage/captures/<MMDD-HHMMSS>/
+    logcat.txt  crash.txt  audio_flinger.txt  audio.txt
+    thermal.txt anr.txt    dmesg.txt
 ```
 
-No dependencies. Works unrooted; prompts for `su` only if it's available.
+They live *inside* the project dir so they travel with it, but `captures/` is
+gitignored — a 3.7 MB logcat dump never reaches a commit. If `/sdcard` isn't
+writable it falls back to `~/logtriage-captures/`.
+
+Analyze a capture, or all of them:
+
+```bash
+logtriage analyze /sdcard/logtriage/captures/0930-200157
+logtriage analyze /sdcard/logtriage/captures          # every capture
+```
+
+## Install
+
+Kept on internal storage (`/sdcard/logtriage`) on purpose: `/sdcard` survives a
+Termux reinstall, `$HOME` does not, and the tree stays browsable and
+adb-accessible.
+
+`sdcardfs` ignores `chmod`, so a script there can never carry the execute bit
+and **cannot be exec'd directly** (`./logtriage.py` → Permission denied). A
+wrapper in Termux home — where the execute bit does stick — supplies the
+`logtriage` command:
+
+```bash
+# source of truth, on internal storage
+cd /sdcard/logtriage && python3 test_logtriage.py
+
+# wrapper (what you actually type)
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/logtriage <<'EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+exec python3 /sdcard/logtriage/logtriage.py "$@"
+EOF
+chmod +x ~/.local/bin/logtriage
+```
+
+No dependencies. Python 3.10+. Works unrooted; prompts for `su` only if it's
+available.
+
+## Do not `su` first
+
+`su` with no arguments drops you into Android's `/system/bin/sh` with Android's
+`PATH`, so `logtriage` (and Termux's Python) disappear from the command line:
+
+```
+~ $ su
+:/data/data/com.termux/files/home # logtriage capture
+/system/bin/sh: logtriage: inaccessible or not found
+```
+
+Run `logtriage capture` straight from the Termux prompt. It calls `su` itself
+for the privileged parts and you approve the Magisk prompt once.
 
 ## Use
 

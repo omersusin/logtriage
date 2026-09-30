@@ -3,3 +3,5 @@ __pycache__/
 .venv/
 *.egg-info/
 .DS_Store
+# capture output — real device logs, never commit these
+captures/
